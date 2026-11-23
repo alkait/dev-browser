@@ -1,0 +1,14 @@
+{
+  "name": "dev-browser",
+  "description": "Home of the dev-browser plugin: a real, signed-in browser your agent can drive.",
+  "owner": {
+    "name": "Ayman Alkait"
+  },
+  "plugins": [
+    {
+      "name": "dev-browser",
+      "source": "./",
+      "description": "A real, signed-in browser your agent can drive, through the chrome-devtools MCP server."
+    }
+  ]
+}

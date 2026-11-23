@@ -1,0 +1,9 @@
+{
+  "manifest_version": 3,
+  "name": "dev-browser test fixture",
+  "version": "1.0",
+  "description": "Marks every page so the dev-browser tests can tell the extension loaded.",
+  "content_scripts": [
+    { "matches": ["<all_urls>"], "js": ["content.js"], "run_at": "document_start" }
+  ]
+}

@@ -1,0 +1,27 @@
+{
+  "name": "dev-browser",
+  "displayName": "Dev Browser",
+  "version": "0.1.0",
+  "description": "A real, signed-in browser your agent can drive. Launches Chrome, Brave, Edge or Chromium with its own persistent profile and no automation flags (so Google sign-in works), and connects the chrome-devtools MCP server to it for clicking, screenshots, console logs, network requests and testing unpacked extensions.",
+  "author": {
+    "name": "Ayman Alkait"
+  },
+  "repository": "https://github.com/alkait/dev-browser",
+  "homepage": "https://github.com/alkait/dev-browser",
+  "license": "MIT",
+  "keywords": [
+    "browser",
+    "chrome",
+    "brave",
+    "devtools",
+    "mcp",
+    "debugging",
+    "extensions"
+  ],
+  "network": {
+    "hosts": [
+      "registry.npmjs.org",
+      "127.0.0.1"
+    ]
+  }
+}

@@ -1,0 +1,412 @@
+#!/bin/sh
+# dev-browser: a real, signed-in browser that coding agents can drive.
+#
+# Starts Chrome, Brave, Edge or Chromium with its own persistent profile and a
+# DevTools debugging port, so the chrome-devtools MCP server can attach to it.
+# It is launched like a normal browser, without automation flags, so Google
+# sign-in works and sign-ins persist in the profile.
+#
+# Usage:
+#   dev-browser [start] [options] [URL]   start the browser (or open URL in it)
+#   dev-browser restart [options] [URL]   stop, then start (to load extension changes)
+#   dev-browser stop                      close the browser this tool started
+#   dev-browser status                    show whether it is running, and its settings
+#   dev-browser mcp [args]                run the chrome-devtools MCP server for it
+#
+# Options:
+#   --browser NAME|PATH  chrome, brave, brave-origin, edge, chromium, chrome-canary,
+#                        or a path to a browser executable   [default: first found]
+#   --profile NAME|DIR   profile name, or a directory path    [default: default]
+#   --port N             DevTools debugging port              [default: 9222]
+#   --ext DIR            load an unpacked extension (repeatable). Run from a
+#                        folder with a manifest.json to load it automatically.
+#
+# Settings can also come from environment variables (DEV_BROWSER_BIN,
+# DEV_BROWSER_PROFILE, DEV_BROWSER_PORT, DEV_BROWSER_MCP_ARGS) or from the config file
+# ~/.config/dev-browser/config, which holds the same variables, e.g.
+#   DEV_BROWSER_BIN=brave
+# Precedence: options, then environment, then config file.
+#
+# Security: while it runs, any program on this computer can control this
+# browser, including sites you are signed in to. Stop it when you are done.
+
+VERSION=0.1.0
+
+die() { echo "dev-browser: $*" >&2; exit 1; }
+
+# ---------------------------------------------------------------- settings --
+
+CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/dev-browser/config"
+DATA_ROOT="${XDG_DATA_HOME:-$HOME/.local/share}/dev-browser"
+
+env_bin=${DEV_BROWSER_BIN-}
+env_profile=${DEV_BROWSER_PROFILE-}
+env_port=${DEV_BROWSER_PORT-}
+env_mcp_args=${DEV_BROWSER_MCP_ARGS-}
+DEV_BROWSER_BIN='' DEV_BROWSER_PROFILE='' DEV_BROWSER_PORT='' DEV_BROWSER_MCP_ARGS=''
+# shellcheck disable=SC1090
+[ -f "$CONFIG_FILE" ] && . "$CONFIG_FILE"
+[ -n "$env_bin" ] && DEV_BROWSER_BIN=$env_bin
+[ -n "$env_profile" ] && DEV_BROWSER_PROFILE=$env_profile
+[ -n "$env_port" ] && DEV_BROWSER_PORT=$env_port
+[ -n "$env_mcp_args" ] && DEV_BROWSER_MCP_ARGS=$env_mcp_args
+
+OPT_BROWSER=$DEV_BROWSER_BIN
+OPT_PROFILE=${DEV_BROWSER_PROFILE:-default}
+PORT=${DEV_BROWSER_PORT:-9222}
+EXTS=''
+URL=''
+
+# Candidate executables for each browser name, one per line.
+candidates() {
+  case $(uname -s) in
+    Darwin)
+      for a in /Applications "$HOME/Applications"; do
+        case $1 in
+          chrome)        echo "$a/Google Chrome.app/Contents/MacOS/Google Chrome" ;;
+          chrome-canary) echo "$a/Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary" ;;
+          brave)         echo "$a/Brave Browser.app/Contents/MacOS/Brave Browser" ;;
+          brave-origin)  echo "$a/Brave Origin.app/Contents/MacOS/Brave Origin" ;;
+          edge)          echo "$a/Microsoft Edge.app/Contents/MacOS/Microsoft Edge" ;;
+          chromium)      echo "$a/Chromium.app/Contents/MacOS/Chromium" ;;
+        esac
+      done ;;
+    *)
+      case $1 in
+        chrome)        set -- google-chrome-stable google-chrome ;;
+        chrome-canary) set -- google-chrome-unstable google-chrome-canary ;;
+        brave)         set -- brave-browser brave ;;
+        brave-origin)  set -- brave-origin ;;
+        edge)          set -- microsoft-edge-stable microsoft-edge ;;
+        chromium)      set -- chromium chromium-browser ;;
+        *)             set -- ;;
+      esac
+      for c in "$@"; do command -v "$c" 2>/dev/null; done ;;
+  esac
+}
+
+# Sets BROWSER_PATH and BROWSER_SLUG from a name, a path, or auto-detection.
+resolve_browser() {
+  BROWSER_PATH='' BROWSER_SLUG=''
+  case $1 in
+    */*)
+      [ -x "$1" ] || die "browser executable not found: $1"
+      BROWSER_PATH=$1
+      BROWSER_SLUG=$(basename "$1" | tr 'A-Z ' 'a-z-')
+      return ;;
+    '') names='chrome brave brave-origin edge chromium chrome-canary' ;;
+    chrome|chrome-canary|brave|brave-origin|edge|chromium) names=$1 ;;
+    *) die "unknown browser '$1' (use chrome, brave, brave-origin, edge, chromium, chrome-canary, or a path)" ;;
+  esac
+  for n in $names; do
+    found=$(candidates "$n" | while IFS= read -r p; do
+      [ -n "$p" ] && [ -x "$p" ] && { echo "$p"; break; }
+    done)
+    if [ -n "$found" ]; then BROWSER_PATH=$found BROWSER_SLUG=$n; return; fi
+  done
+  [ -n "$1" ] && die "$1 is not installed (or set DEV_BROWSER_BIN to its executable path)"
+  die "no supported browser found; install Chrome, Brave, Edge or Chromium, or set DEV_BROWSER_BIN"
+}
+
+resolve_profile() {
+  case $OPT_PROFILE in
+    */*) PROFILE=$OPT_PROFILE ;;
+    *)   PROFILE="$DATA_ROOT/profiles/$BROWSER_SLUG/$OPT_PROFILE" ;;
+  esac
+}
+
+parse_opts() {
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --browser) [ $# -ge 2 ] || die "--browser needs a value"; OPT_BROWSER=$2; shift 2 ;;
+      --profile) [ $# -ge 2 ] || die "--profile needs a value"; OPT_PROFILE=$2; shift 2 ;;
+      --port)    [ $# -ge 2 ] || die "--port needs a value"; PORT=$2; shift 2 ;;
+      --ext)
+        [ $# -ge 2 ] || die "--ext needs a directory"
+        [ -f "$2/manifest.json" ] || die "no manifest.json in extension folder: $2"
+        d=$(cd "$2" && pwd) || exit 1
+        EXTS="${EXTS:+$EXTS,}$d"; shift 2 ;;
+      --*=*) o=${1%%=*}; v=${1#*=}; shift; set -- "$o" "$v" "$@" ;;
+      -h|--help) usage; exit 0 ;;
+      -*) die "unknown option: $1 (see dev-browser --help)" ;;
+      *) [ -z "$URL" ] || die "only one URL can be given"; URL=$1; shift ;;
+    esac
+  done
+  case $PORT in ''|*[!0-9]*) die "port must be a number: $PORT" ;; esac
+  if [ -z "$EXTS" ] && grep -qs '"manifest_version"' "$PWD/manifest.json"; then
+    EXTS=$PWD
+  fi
+}
+
+usage() { sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//'; }
+
+# ------------------------------------------------------------------ probes --
+
+RUN_DIR="$DATA_ROOT/run"
+state_file() { echo "$RUN_DIR/$PORT.state"; }
+ENDPOINT() { echo "http://127.0.0.1:$PORT"; }
+
+# Prints /json/version if a DevTools endpoint answers on the port.
+cdp_version() { curl -sf --max-time 2 "$(ENDPOINT)/json/version" 2>/dev/null; }
+
+json_field() { # json_field KEY  (reads one-level JSON on stdin)
+  sed -n "s/.*\"$1\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" | head -1
+}
+
+listener_pid() {
+  if command -v lsof >/dev/null 2>&1; then
+    lsof -nP -iTCP:"$PORT" -sTCP:LISTEN -t 2>/dev/null | head -1
+  elif command -v ss >/dev/null 2>&1; then
+    ss -ltnpH "sport = :$PORT" 2>/dev/null | sed -n 's/.*pid=\([0-9]*\).*/\1/p' | head -1
+  fi
+}
+
+pid_cmd() { ps -ww -o command= -p "$1" 2>/dev/null; }
+alive() { [ -n "$1" ] && kill -0 "$1" 2>/dev/null; }
+
+wait_exit() { # wait_exit PID SECONDS: true once PID has exited
+  n=0
+  while alive "$1"; do
+    [ $n -ge $(($2 * 4)) ] && return 1
+    sleep 0.25; n=$((n + 1))
+  done
+}
+
+# Reads the state file written at launch: STATE_PID, STATE_PROFILE, STATE_BROWSER.
+read_state() {
+  STATE_PID='' STATE_PROFILE='' STATE_BROWSER=''
+  f=$(state_file)
+  [ -f "$f" ] || return 1
+  STATE_PID=$(sed -n 's/^pid=//p' "$f")
+  STATE_PROFILE=$(sed -n 's/^profile=//p' "$f")
+  STATE_BROWSER=$(sed -n 's/^browser=//p' "$f")
+}
+
+# Prints the PID of the browser this tool started on $PORT, if it is running.
+our_pid() {
+  if read_state && alive "$STATE_PID"; then
+    case $(pid_cmd "$STATE_PID") in
+      *"--user-data-dir=$STATE_PROFILE "*) echo "$STATE_PID"; return 0 ;;
+    esac
+  fi
+  # No usable state file: accept a listener that uses a profile under our data dir.
+  p=$(listener_pid)
+  if [ -n "$p" ]; then
+    case $(pid_cmd "$p") in
+      *"--user-data-dir=$DATA_ROOT/"*) echo "$p"; return 0 ;;
+    esac
+  fi
+  return 1
+}
+
+# Prints the PID of a browser main process already using $PROFILE.
+profile_user() {
+  ps -ww -A -o pid=,command= 2>/dev/null | grep -F -- "--user-data-dir=$PROFILE " |
+    grep -v -- '--type=' | grep -v grep | awk '{print $1}' | head -1
+}
+
+page_count() {
+  curl -sf --max-time 2 "$(ENDPOINT)/json/list" 2>/dev/null | grep -c '"type": *"page"'
+}
+
+# Apps started from the Dock (like the Claude desktop app) get a minimal PATH
+# without the user's shell setup. If node is missing, look where Node version
+# managers and package managers usually put it.
+find_node() {
+  command -v node >/dev/null 2>&1 && return 0
+  nvm_dir=${NVM_DIR:-$HOME/.nvm}
+  # nvm: the default alias if it names a version (e.g. 22), else the newest.
+  v=$(cat "$nvm_dir/alias/default" 2>/dev/null)
+  case $v in [0-9]*|v[0-9]*) pat="v${v#v}" ;; *) pat=v ;; esac
+  nvm_bin=$(for d in "$nvm_dir"/versions/node/"$pat"*/bin; do
+      [ -d "$d" ] && echo "$d"
+    done | awk -F/ '{ v = $(NF-1); sub(/^v/, "", v); print v "|" $0 }' |
+    sort -t. -k1,1n -k2,2n -k3,3n | tail -1 | cut -d'|' -f2)
+  for d in $nvm_bin /opt/homebrew/bin /usr/local/bin "$HOME/.volta/bin" \
+    "$HOME/.local/share/fnm/aliases/default/bin" "$HOME/.local/share/mise/shims" \
+    "$HOME/.asdf/shims" "$HOME/.local/bin"; do
+    if [ -x "$d/node" ]; then PATH="$d:$PATH"; export PATH; return 0; fi
+  done
+  return 1
+}
+find_node
+
+# cdp_browser METHOD [KEY=VALUE...]: send one DevTools command to the browser
+# endpoint; prints the JSON reply, and fails if the browser returned an error.
+cdp_browser() {
+  command -v node >/dev/null 2>&1 || return 2
+  ws=$(cdp_version | json_field webSocketDebuggerUrl)
+  [ -n "$ws" ] || return 1
+  node -e '
+    const [ws, method, ...kv] = process.argv.slice(1);
+    const params = Object.fromEntries(kv.map((s) => [s.slice(0, s.indexOf("=")), s.slice(s.indexOf("=") + 1)]));
+    const sock = new WebSocket(ws);
+    setTimeout(() => process.exit(1), 10000);
+    sock.onopen = () => sock.send(JSON.stringify({ id: 1, method, params }));
+    sock.onmessage = (e) => { const m = JSON.parse(e.data); if (m.id !== 1) return;
+      console.log(JSON.stringify(m.result ?? m.error)); process.exit(m.error ? 1 : 0); };
+    sock.onclose = () => process.exit(method === "Browser.close" ? 0 : 1);
+    sock.onerror = () => process.exit(1);
+  ' "$ws" "$@" 2>/dev/null
+}
+
+# Loads (or reloads) each unpacked extension in $EXTS into the running browser.
+load_exts() {
+  [ -n "$EXTS" ] || return 0
+  old_ifs=$IFS; IFS=,
+  for d in $EXTS; do
+    IFS=$old_ifs
+    if r=$(cdp_browser Extensions.loadUnpacked "path=$d"); then
+      echo "Loaded extension: $d (id $(echo "$r" | json_field id))"
+    else
+      case $r in
+        *"not available"*|*"not found"*)
+          die "this browser was started without extension loading enabled; run: dev-browser restart --ext $d" ;;
+        *) die "could not load extension $d: ${r:-no reply from browser}" ;;
+      esac
+    fi
+  done
+  IFS=$old_ifs
+}
+
+open_url() {
+  [ -n "$1" ] || return 0
+  curl -sf --max-time 5 -X PUT "$(ENDPOINT)/json/new?$1" >/dev/null ||
+    die "browser is running but could not open $1"
+  echo "Opened $1"
+}
+
+# ---------------------------------------------------------------- commands --
+
+cmd_status() {
+  parse_opts "$@"
+  if v=$(cdp_version); then
+    pid=$(our_pid)
+    echo "running: yes"
+    echo "browser: $(echo "$v" | json_field Browser)"
+    echo "port:    $PORT"
+    if [ -n "$pid" ]; then
+      read_state
+      echo "pid:     $pid"
+      [ -n "$STATE_PROFILE" ] && echo "profile: $STATE_PROFILE"
+    else
+      echo "note:    this browser was not started by dev-browser"
+    fi
+    echo "tabs:    $(page_count)"
+    return 0
+  fi
+  resolve_browser "$OPT_BROWSER"; resolve_profile
+  echo "running: no"
+  echo "browser: $BROWSER_PATH"
+  echo "profile: $PROFILE"
+  echo "port:    $PORT"
+  echo "config:  $CONFIG_FILE$([ -f "$CONFIG_FILE" ] || echo ' (not created)')"
+  return 1
+}
+
+cmd_start() {
+  parse_opts "$@"
+
+  if v=$(cdp_version); then
+    if pid=$(our_pid); then
+      echo "Already running: $(echo "$v" | json_field Browser) on port $PORT (PID $pid)"
+      load_exts
+      open_url "$URL"
+      return 0
+    fi
+    die "port $PORT is used by a browser dev-browser did not start (PID $(listener_pid)). Use --port to pick another port."
+  fi
+  if p=$(listener_pid) && [ -n "$p" ]; then
+    die "port $PORT is in use by another program (PID $p: $(pid_cmd "$p" | cut -c1-80)). Use --port."
+  fi
+
+  resolve_browser "$OPT_BROWSER"; resolve_profile
+  if p=$(profile_user) && [ -n "$p" ]; then
+    die "profile $PROFILE is already open in another browser (PID $p). Stop it first, or use --profile NAME."
+  fi
+  mkdir -p "$PROFILE" "$RUN_DIR" || die "cannot create $PROFILE"
+  log="$RUN_DIR/$PORT.log"
+
+  # --user-data-dir must stay first and be followed by more arguments: the
+  # process lookups above match "--user-data-dir=PATH " with a trailing space.
+  # --enable-unsafe-extension-debugging lets DevTools load unpacked extensions
+  # (Extensions.loadUnpacked). Google Chrome 137+ ignores --load-extension.
+  set -- --user-data-dir="$PROFILE" --remote-debugging-port="$PORT" \
+    --no-first-run --no-default-browser-check --enable-unsafe-extension-debugging
+  if [ -n "$EXTS" ] && ! command -v node >/dev/null 2>&1; then
+    echo "node not found; loading extension(s) with --load-extension (ignored by Google Chrome)"
+    set -- "$@" --load-extension="$EXTS" \
+      --disable-features=DisableLoadExtensionCommandLineSwitch
+    EXTS=''
+  fi
+  # With extensions to load, open the URL only after they are loaded.
+  first_url=${URL:-about:blank}
+  [ -n "$EXTS" ] && first_url=about:blank
+  nohup "$BROWSER_PATH" "$@" "$first_url" >"$log" 2>&1 &
+  pid=$!
+  printf 'pid=%s\nprofile=%s\nbrowser=%s\n' "$pid" "$PROFILE" "$BROWSER_PATH" >"$(state_file)"
+
+  i=0
+  while [ $i -lt 60 ]; do
+    if v=$(cdp_version); then
+      echo "Ready: $(echo "$v" | json_field Browser) on port $PORT (PID $pid)"
+      echo "Profile: $PROFILE"
+      load_exts
+      # Some browsers show a welcome page instead of the URL on a new profile.
+      if [ -n "$URL" ]; then
+        sleep 1
+        curl -sf --max-time 2 "$(ENDPOINT)/json/list" | grep -qF "\"url\": \"$URL" ||
+          open_url "$URL"
+      fi
+      return 0
+    fi
+    if ! alive "$pid"; then
+      rm -f "$(state_file)"
+      echo "dev-browser: the browser exited before it was ready. Last log lines ($log):" >&2
+      tail -n 15 "$log" >&2
+      exit 1
+    fi
+    sleep 0.5; i=$((i + 1))
+  done
+  die "browser started (PID $pid) but port $PORT did not answer within 30s; see $log"
+}
+
+cmd_stop() {
+  parse_opts "$@"
+  if ! pid=$(our_pid); then
+    rm -f "$(state_file)"
+    if cdp_version >/dev/null; then
+      die "the browser on port $PORT was not started by dev-browser; not stopping it"
+    fi
+    echo "Not running."
+    return 0
+  fi
+  # Ask the browser to quit cleanly over DevTools, so it saves cookies (and
+  # with them, sign-ins). SIGTERM can lose the most recent ones.
+  cdp_browser Browser.close >/dev/null
+  wait_exit "$pid" 15 || kill -TERM "$pid" 2>/dev/null
+  wait_exit "$pid" 10 || kill -KILL "$pid" 2>/dev/null
+  wait_exit "$pid" 2
+  rm -f "$(state_file)"
+  echo "Stopped (PID $pid)."
+}
+
+cmd_mcp() {
+  command -v npx >/dev/null 2>&1 || die "npx not found; install Node.js 20 or newer"
+  # DEV_BROWSER_MCP_ARGS: extra chrome-devtools-mcp flags, split on spaces
+  # (e.g. "--no-usage-statistics --no-performance-crux").
+  # shellcheck disable=SC2086
+  exec npx -y chrome-devtools-mcp@latest --browserUrl "http://127.0.0.1:$PORT" \
+    ${DEV_BROWSER_MCP_ARGS-} "$@"
+}
+
+case ${1-} in
+  start)   shift; cmd_start "$@" ;;
+  restart) shift; ( cmd_stop "$@" ) >/dev/null || exit 1; cmd_start "$@" ;;
+  stop)    shift; cmd_stop "$@" ;;
+  status)  shift; cmd_status "$@" ;;
+  mcp)     shift; cmd_mcp "$@" ;;
+  -v|--version|version) echo "dev-browser $VERSION" ;;
+  -h|--help|help) usage ;;
+  *) cmd_start "$@" ;;
+esac
