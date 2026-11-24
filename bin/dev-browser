@@ -269,6 +269,21 @@ load_exts() {
   IFS=$old_ifs
 }
 
+# Makes the browser start with no tabs from last time: deletes the saved
+# session (open tabs and windows) of every profile in $PROFILE, and marks the
+# last exit as clean so no "Restore pages?" prompt appears. Sign-ins, cookies,
+# history and bookmarks are kept.
+forget_tabs() {
+  for d in "$PROFILE"/*/; do
+    [ -f "$d/Preferences" ] || continue
+    rm -rf "$d/Sessions" "$d/Current Session" "$d/Current Tabs" \
+      "$d/Last Session" "$d/Last Tabs"
+    sed -i.bak -e 's/"exit_type":"[A-Za-z]*"/"exit_type":"Normal"/' \
+      -e 's/"exited_cleanly":false/"exited_cleanly":true/' "$d/Preferences" &&
+      rm -f "$d/Preferences.bak"
+  done
+}
+
 open_url() {
   [ -n "$1" ] || return 0
   curl -sf --max-time 5 -X PUT "$(ENDPOINT)/json/new?$1" >/dev/null ||
@@ -326,13 +341,15 @@ cmd_start() {
   fi
   mkdir -p "$PROFILE" "$RUN_DIR" || die "cannot create $PROFILE"
   log="$RUN_DIR/$PORT.log"
+  forget_tabs
 
   # --user-data-dir must stay first and be followed by more arguments: the
   # process lookups above match "--user-data-dir=PATH " with a trailing space.
   # --enable-unsafe-extension-debugging lets DevTools load unpacked extensions
   # (Extensions.loadUnpacked). Google Chrome 137+ ignores --load-extension.
   set -- --user-data-dir="$PROFILE" --remote-debugging-port="$PORT" \
-    --no-first-run --no-default-browser-check --enable-unsafe-extension-debugging
+    --no-first-run --no-default-browser-check --enable-unsafe-extension-debugging \
+    --hide-crash-restore-bubble
   if [ -n "$EXTS" ] && ! command -v node >/dev/null 2>&1; then
     echo "node not found; loading extension(s) with --load-extension (ignored by Google Chrome)"
     set -- "$@" --load-extension="$EXTS" \
